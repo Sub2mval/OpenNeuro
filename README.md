@@ -168,5 +168,5 @@ Don't try to run it; use `demo_multi_app.py` instead.
 
 ## Demo Video
 
-**[TODO: paste your 2-minute demo video link here before submitting]**
-
+https://www.youtube.com/watch?v=dPDJ1-Uy3uQ
+](https://www.youtube.com/watch?v=dPDJ1-Uy3uQ)

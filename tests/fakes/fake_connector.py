@@ -1,77 +1,95 @@
-"""Test fake for ApplicationConnector, scoped to the execution layer's own
-unit tests.
+"""In-process test double for the ApplicationConnector protocol.
 
-Provided because, at the time this worker ran, its isolated sandbox did not
-contain a canonical ApplicationConnector test fake (that would normally
-come from 02_protocol.md or 08_test_llm_and_simulation.md). If the
-integrated repository already provides a compatible one under tests/fakes/,
-the integrator should keep only one canonical implementation and delete
-this duplicate.
+Structural (duck-typed) implementation of:
+
+    class ApplicationConnector(Protocol):
+        application_id: ApplicationId
+        async def start(self, gateway: ApplicationGateway) -> None: ...
+        async def dispatch_action(self, request: ActionRequest) -> ActionResult: ...
+        async def stop(self) -> None: ...
+
+Not imported from openneuro.protocol directly (that worker's module may be
+absent in this sandbox) -- this class simply satisfies the shape.
 """
 from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, List
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Set
 
-if TYPE_CHECKING:
-    from openneuro.domain.models import ActionRequest, ActionResult
-    from openneuro.protocol import ApplicationGateway
+from . import ActionRequest, ActionResult, ApplicationId
 
 
 @dataclass
+class RecordedCall:
+    """A single call made against a FakeConnector, for test assertions."""
+
+    name: str
+    args: Dict[str, Any] = field(default_factory=dict)
+
+
 class FakeConnector:
-    """Minimal in-process ApplicationConnector double.
+    """Scriptable double for ApplicationConnector.
 
-    Configure exactly one behavior per instance:
-
-    - Immediate success/failure: set `result` to an ActionResult-like
-      object (with success=True or success=False) and leave `hang_seconds`
-      as None. dispatch_action returns `result` right away.
-
-    - Hang past the caller's timeout: set `hang_seconds` to longer than the
-      caller's timeout. dispatch_action sleeps; when the caller's
-      asyncio.wait_for times out, this task is cancelled during that
-      sleep and dispatch_action never produces a result.
-
-    - Hang, then produce a late result anyway (simulates a connector that
-      does not honor cancellation): same as above but with
-      `ignore_cancellation=True`. The first CancelledError raised into the
-      sleep is swallowed once, then it sleeps again and returns `result` -
-      i.e. a real result arrives *after* the caller already timed out.
-
-    Every call records request.id in `dispatched_request_ids`, in order,
-    including calls that are later cancelled.
+    - Records every call (``start``/``dispatch_action``/``stop``) in order.
+    - Lets tests queue one or more ``ActionResult``s per action name; each
+      dispatch consumes the next queued result (or falls back to a generic
+      success result if none was queued).
+    - Lets tests mark an action name as "hanging" so ``dispatch_action``
+      never resolves, to exercise executor-level timeout/cancellation logic
+      elsewhere in the system.
     """
 
-    application_id: str = "fake-app"
-    result: "ActionResult | None" = None
-    hang_seconds: "float | None" = None
-    ignore_cancellation: bool = False
-    dispatched_request_ids: List[Any] = field(default_factory=list)
+    def __init__(self, application_id: ApplicationId) -> None:
+        self.application_id = application_id
+        self.calls: List[RecordedCall] = []
+        self.started_with_gateway: Optional[Any] = None
+        self.stopped: bool = False
+        self._queued_results: Dict[str, List[ActionResult]] = {}
+        self._hang_actions: Set[str] = set()
 
-    async def start(self, gateway: "ApplicationGateway") -> None:  # pragma: no cover
-        return None
+    # -- scripting API ------------------------------------------------------
 
-    async def stop(self) -> None:  # pragma: no cover
-        return None
+    def queue_result(self, action_name: str, result: ActionResult) -> None:
+        self._queued_results.setdefault(action_name, []).append(result)
 
-    async def dispatch_action(self, request: "ActionRequest") -> "ActionResult":
-        self.dispatched_request_ids.append(request.id)
+    def hang_on(self, action_name: str) -> None:
+        self._hang_actions.add(action_name)
 
-        if self.hang_seconds is not None:
-            try:
-                await asyncio.sleep(self.hang_seconds)
-            except asyncio.CancelledError:
-                if not self.ignore_cancellation:
-                    raise
-                # Simulate a connector that doesn't honor cancellation:
-                # keep running and eventually produce a real result.
-                await asyncio.sleep(self.hang_seconds)
+    def unhang(self, action_name: str) -> None:
+        self._hang_actions.discard(action_name)
 
-        if self.result is None:
-            raise AssertionError(
-                "FakeConnector.result must be set for a non-hanging dispatch, "
-                "or hang_seconds must lead to a raised CancelledError"
-            )
-        return self.result
+    # -- ApplicationConnector shape ------------------------------------------
+
+    async def start(self, gateway: Any) -> None:
+        self.calls.append(RecordedCall("start", {"gateway": gateway}))
+        self.started_with_gateway = gateway
+        self.stopped = False
+
+    async def dispatch_action(self, request: ActionRequest) -> ActionResult:
+        self.calls.append(RecordedCall("dispatch_action", {"request": request}))
+        if request.action_name in self._hang_actions:
+            # Never resolves; the caller (executor) is responsible for
+            # timing out and/or cancelling this coroutine.
+            await asyncio.Event().wait()
+
+        queue = self._queued_results.get(request.action_name)
+        if queue:
+            return queue.pop(0)
+
+        return ActionResult(
+            request_id=request.id,
+            success=True,
+            message=f"fake-default-result:{request.action_name}",
+            completed_at=datetime.now(timezone.utc),
+        )
+
+    async def stop(self) -> None:
+        self.calls.append(RecordedCall("stop"))
+        self.stopped = True
+
+    # -- assertion helpers ----------------------------------------------------
+
+    def call_names(self) -> List[str]:
+        return [call.name for call in self.calls]
